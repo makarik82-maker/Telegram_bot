@@ -8,22 +8,18 @@ from datetime import datetime, timedelta
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GIGA_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
-GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat")  # Модель по умолчанию
 
 def get_rss_news():
     """Собираем новости из RSS ТАСС"""
     print("Собираю новости...")
-    # RSS лента ТАСС - основные новости
     url = "https://tass.ru/rss/v2.xml"
     news_list = []
     try:
         feed = feedparser.parse(url)
-        # Берем первые 5 новостей
         for entry in feed.entries[:5]:
             news_list.append(f"- {entry.title}")
     except Exception as e:
         print(f"Ошибка при чтении RSS ТАСС: {e}")
-        # Резервный источник - экономика ТАСС
         try:
             feed = feedparser.parse("https://tass.ru/rss/economy.xml")
             for entry in feed.entries[:5]:
@@ -35,17 +31,13 @@ def get_rss_news():
 def get_weather():
     """Получаем погоду из Open-Meteo (сегодня и завтра)"""
     print("Получаю погоду...")
-    # Координаты Москвы
     url = "https://api.open-meteo.com/v1/forecast?latitude=55.75&longitude=37.62&current_weather=true&daily=temperature_2m_max,temperature_2m_min&timezone=Europe%2FMoscow"
     try:
         response = requests.get(url)
         data = response.json()
         
-        # Текущая погода
         current_temp = data['current_weather']['temperature']
         current_wind = data['current_weather']['windspeed']
-        
-        # Прогноз на завтра
         tomorrow_max = data['daily']['temperature_2m_max'][1]
         tomorrow_min = data['daily']['temperature_2m_min'][1]
         
@@ -61,18 +53,30 @@ def process_with_gigachat(news, weather):
     print("Обрабатываю данные в Gigachat...")
     
     try:
-        # Инициализируем Gigachat с указанием модели
+        # 1. Инициализируем клиент
         ai = GigaChat(
             credentials=GIGA_CREDENTIALS, 
             scope="GIGACHAT_API_PERS", 
-            verify_ssl_certs=False,
-            model=GIGACHAT_MODEL  # Используем переменную окружения
+            verify_ssl_certs=False
         )
+        
+        # 2. ВАЖНО: запрашиваем список доступных моделей, чтобы узнать точное название
+        try:
+            available_models = ai.models()
+            # Выводим в лог GitHub, чтобы мы видели, какие модели доступны
+            model_names = [m.id for m in available_models.data]
+            print(f"✅ Доступные модели: {model_names}")
+            
+            # Используем первую доступную модель (обычно это 'GigaChat')
+            target_model = model_names[0]
+        except Exception as e:
+            print(f"⚠️ Не удалось получить список моделей, используем 'GigaChat' по умолчанию. Ошибка: {e}")
+            target_model = "GigaChat"
         
         prompt = f"""
         Ты - редактор новостного Telegram-канала. 
         Я дам тебе сырые данные. Твоя задача - написать из них короткий, интересный и структурированный пост для Telegram.
-        Используй эмодзи. Раздели на блоки:  Погода,  Новости (ТАСС).
+        Используй эмодзи. Раздели на блоки: 🌤 Погода, 📰 Новости (ТАСС).
         Не выдумывай того, чего нет в данных. 
         ВАЖНО: Объем текста строго до 3500 символов (лимит Telegram).
         
@@ -81,20 +85,20 @@ def process_with_gigachat(news, weather):
         Новости ТАСС: {news}
         """
         
-        response = ai.chat(prompt)
+        # 3. ВАЖНО: передаем параметр model ПРЯМО в метод chat()
+        response = ai.chat(prompt, model=target_model)
         return response.choices[0].message.content
         
     except Exception as e:
-        print(f"Ошибка Gigachat: {e}")
-        # Если нейросеть сломалась, отправим хотя бы сырые данные
-        return f" Нейросеть занята, вот сырые данные:\n\n {weather}\n\n Новости ТАСС:\n{news}"
+        print(f"❌ Ошибка Gigachat: {e}")
+        # Если нейросеть не ответила, отправляем сырые данные
+        return f"🤖 Нейросеть временно недоступна, вот сырые данные:\n\n🌤 {weather}\n\n📰 Новости ТАСС:\n{news}"
 
 def send_to_telegram(text):
     """Отправляем текст в Telegram"""
     print("Отправляю в Telegram...")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     
-    # Telegram не любит сообщения длиннее 4096 символов, обрезаем на всякий случай
     if len(text) > 4000:
         text = text[:3990] + "\n\n...(текст обрезан)"
         
@@ -107,23 +111,20 @@ def send_to_telegram(text):
     try:
         response = requests.post(url, data=payload)
         if response.status_code == 200:
-            print("Успешно отправлено!")
+            print("✅ Успешно отправлено!")
         else:
-            print(f"Ошибка Telegram: {response.text}")
+            print(f"❌ Ошибка Telegram: {response.text}")
     except Exception as e:
-        print(f"Ошибка отправки: {e}")
+        print(f"❌ Ошибка отправки: {e}")
 
 if __name__ == "__main__":
     print("=== Бот запущен ===")
     
-    # 1. Собираем данные
     raw_news = get_rss_news()
     raw_weather = get_weather()
     
-    # 2. Прогоняем через нейросеть
     final_post = process_with_gigachat(raw_news, raw_weather)
     
-    # 3. Публикуем
     send_to_telegram(final_post)
     
     print("=== Бот завершил работу ===")
