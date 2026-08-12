@@ -1,7 +1,6 @@
 import os
 import requests
 import feedparser
-import yfinance as yf
 from gigachat import GigaChat
 from datetime import datetime, timedelta
 
@@ -57,77 +56,111 @@ def get_weather():
         return "Не удалось получить погоду."
 
 def get_moex_stocks():
-    """Получаем данные по акциям MOEX и находим ТОП 3 роста и падения"""
+    """Получаем данные по акциям MOEX через официальный API Московской биржи"""
     print("Получаю данные MOEX...")
     
-    # Список популярных акций MOEX
-    tickers = [
-        "SBER.ME",    # Сбербанк
-        "GAZP.ME",    # Газпром
-        "LKOH.ME",    # Лукойл
-        "YNDX.ME",    # Яндекс
-        "TCSG.ME",    # Тинькофф
-        "ROSN.ME",    # Роснефть
-        "NVTK.ME",    # Новатэк
-        "PLZL.ME",    # Полюс Золото
-        "SNGS.ME",    # Сургутнефтегаз
-        "GMKN.ME",    # Норникель
-        "MTSS.ME",    # МТС
-        "AFKS.ME",    # АФК Система
-        "MGNT.ME",    # Магнит
-        "ALRS.ME",    # АЛРОСА
-        "FEES.ME",    # ФСК ЕЭС
-    ]
-    
-    stocks_data = []
-    
-    for ticker in tickers:
-        try:
-            stock = yf.Ticker(ticker)
-            # Получаем данные за сегодня (1 день)
-            hist = stock.history(period="1d", interval="1m")
-            
-            if not hist.empty and len(hist) > 1:
-                # Первая и последняя цена за день
-                open_price = hist['Open'].iloc[0]
-                close_price = hist['Close'].iloc[-1]
+    try:
+        # Используем официальный API MOEX
+        # Получаем данные по популярным бумагам
+        url = "https://iss.moex.com/iss/reference/23"
+        params = {
+            'iss.json': 'extended',
+            'boardid': 'TQBR',  # Основной рынок акций
+            'limit': 50,
+            'sort': 'WAPR'
+        }
+        
+        response = requests.get(url, params=params, timeout=10)
+        data = response.json()
+        
+        # Получаем данные из секции boarddata
+        if 'boarddata' not in data or 'data' not in data['boarddata']:
+            print("Нет данных от MOEX")
+            return "Не удалось получить данные MOEX"
+        
+        stocks_data = []
+        columns = data['boarddata']['columns']
+        rows = data['boarddata']['data']
+        
+        # Находим индексы нужных колонок
+        idx_short = None
+        idx_wap = None
+        idx_change = None
+        
+        for i, col in enumerate(columns):
+            if col == 'SHORT':
+                idx_short = i
+            elif col == 'WAP':
+                idx_wap = i
+            elif col == 'WAPR':
+                idx_change = i
+        
+        if idx_short is None or idx_wap is None or idx_change is None:
+            print("Не найдены нужные колонки в данных MOEX")
+            return "Ошибка данных MOEX"
+        
+        # Популярные тикеры для фильтрации
+        popular_tickers = {
+            'SBER', 'GAZP', 'LKOH', 'YNDX', 'TCSG', 'ROSN', 
+            'NVTK', 'PLZL', 'SNGS', 'GMKN', 'MTSS', 'AFKS',
+            'MGNT', 'ALRS', 'POLY', 'UPRO', 'PHOR', 'RTKM'
+        }
+        
+        # Обрабатываем данные
+        for row in rows:
+            if len(row) > max(idx_short, idx_wap, idx_change):
+                ticker = row[idx_short]
+                price = row[idx_wap]
+                change = row[idx_change]
                 
-                # Считаем процент изменения
-                change_percent = ((close_price - open_price) / open_price) * 100
-                
-                stocks_data.append({
-                    'ticker': ticker.replace('.ME', ''),
-                    'change': change_percent,
-                    'price': close_price
-                })
-        except Exception as e:
-            print(f"Ошибка получения данных {ticker}: {e}")
-            continue
-    
-    # Сортируем по изменению
-    stocks_data.sort(key=lambda x: x['change'], reverse=True)
-    
-    # ТОП 3 роста
-    top_gainers = stocks_data[:3]
-    # ТОП 3 падения (последние 3)
-    top_losers = stocks_data[-3:][::-1]  # Переворачиваем, чтобы самое большое падение было первым
-    
-    gainers_text = "\n".join([f"- {s['ticker']}: {s['change']:+.2f}% ({s['price']:.2f} ₽)" for s in top_gainers])
-    losers_text = "\n".join([f"- {s['ticker']}: {s['change']:+.2f}% ({s['price']:.2f} ₽)" for s in top_losers])
-    
-    return f" ТОП-3 роста:\n{gainers_text}\n\n📉 ТОП-3 падения:\n{losers_text}"
+                # Фильтруем только популярные тикеры и где есть данные
+                if ticker in popular_tickers and price is not None and change is not None:
+                    stocks_data.append({
+                        'ticker': ticker,
+                        'change': float(change),
+                        'price': float(price)
+                    })
+        
+        # Сортируем по изменению
+        stocks_data.sort(key=lambda x: x['change'], reverse=True)
+        
+        # ТОП 3 роста
+        top_gainers = stocks_data[:3]
+        # ТОП 3 падения (последние 3)
+        top_losers = stocks_data[-3:][::-1]
+        
+        if not top_gainers and not top_losers:
+            return "Нет данных по акциям"
+        
+        gainers_text = "\n".join([f"- {s['ticker']}: {s['change']:+.2f}% ({s['price']:.2f} ₽)" 
+                                  for s in top_gainers]) if top_gainers else "Нет данных"
+        losers_text = "\n".join([f"- {s['ticker']}: {s['change']:+.2f}% ({s['price']:.2f} ₽)" 
+                                 for s in top_losers]) if top_losers else "Нет данных"
+        
+        return f"📈 ТОП-3 роста:\n{gainers_text}\n\n ТОП-3 падения:\n{losers_text}"
+        
+    except Exception as e:
+        print(f"Ошибка получения данных MOEX: {e}")
+        return "Не удалось получить данные MOEX"
 
 def process_with_gigachat(news, weather, stocks):
     """Отправляем сырые данные в Gigachat, чтобы она сделала красивый пост"""
     print("Обрабатываю данные в Gigachat...")
     
-    # Инициализируем Gigachat с указанием модели
-    ai = GigaChat(
-        credentials=GIGA_CREDENTIALS, 
-        scope="GIGACHAT_API_PERS", 
-        verify_ssl_certs=False,
-        model="GigaChat"
-    )
+    # Инициализируем Gigachat без указания модели (используем модель по умолчанию)
+    try:
+        ai = GigaChat(
+            credentials=GIGA_CREDENTIALS, 
+            scope="GIGACHAT_API_PERS", 
+            verify_ssl_certs=False
+        )
+    except Exception as e:
+        print(f"Ошибка инициализации GigaChat: {e}")
+        # Если не получается, пробуем без verify_ssl_certs
+        ai = GigaChat(
+            credentials=GIGA_CREDENTIALS, 
+            scope="GIGACHAT_API_PERS"
+        )
     
     prompt = f"""
     Ты - редактор новостного Telegram-канала. 
@@ -149,7 +182,7 @@ def process_with_gigachat(news, weather, stocks):
     except Exception as e:
         print(f"Ошибка Gigachat: {e}")
         # Если нейросеть сломалась, отправим хотя бы сырые данные
-        return f"🤖 Нейросеть занята, вот сырые данные:\n\n {weather}\n\n📈 Биржа MOEX:\n{stocks}\n\n Новости ТАСС:\n{news}"
+        return f"🤖 Нейросеть занята, вот сырые данные:\n\n🌤 {weather}\n\n📈 Биржа MOEX:\n{stocks}\n\n📰 Новости ТАСС:\n{news}"
 
 def send_to_telegram(text):
     """Отправляем текст в Telegram"""
