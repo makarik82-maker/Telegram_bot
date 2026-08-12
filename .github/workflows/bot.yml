@@ -1,11 +1,13 @@
-name: Daily News Bot
+name: Hourly News Bot
 
 on:
   schedule:
-    # Запуск каждый день в 08:00 по UTC (это 11:00 по Мск). 
-    # Если нужно другое время, меняй цифры. Формат: минута час день месяц день_недели
-    - cron: '0 8 * * *'
-  workflow_dispatch: # Эта строчка позволяет запускать бота вручную кнопкой для тестов
+    # Запуск каждый час с 03:00 до 19:00 по UTC (это 06:00 - 22:00 по Москве)
+    # Формат: минута час день_месяца месяц день_недели
+    - cron: '0 3-19 * * *'
+  
+  # Позволяет запускать вручную для тестирования
+  workflow_dispatch:
 
 jobs:
   build-and-run:
@@ -30,5 +32,15 @@ jobs:
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
-        GIGACHAT_MODEL: ${{ secrets.GIGACHAT_MODEL }}  # Добавьте эту строку
       run: python main.py
+
+    - name: Commit and push published_news.json
+      # Сохраняем файл даже если бот упал на этапе отправки в Telegram, 
+      # чтобы не потерять прогресс, но коммитим только если файл изменился
+      if: always()
+      run: |
+        git config --global user.name 'github-actions[bot]'
+        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+        git add published_news.json
+        git diff --staged --quiet || git commit -m "chore: update published news list [skip ci]"
+        git push
