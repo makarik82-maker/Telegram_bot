@@ -1,7 +1,7 @@
 import os
 import requests
 import feedparser
-from gigachat import GigaChat, GigaChatModel
+from gigachat import GigaChat
 from datetime import datetime, timedelta
 
 # 1. Получаем наши секретные ключи из настроек GitHub
@@ -60,12 +60,12 @@ def process_with_gigachat(news, weather):
     print("Обрабатываю данные в Gigachat...")
     
     try:
-        # Инициализируем Gigachat с явным указанием модели
+        # Инициализируем Gigachat с указанием модели строкой
         ai = GigaChat(
             credentials=GIGA_CREDENTIALS, 
             scope="GIGACHAT_API_PERS", 
             verify_ssl_certs=False,
-            model=GigaChatModel.GIGACHAT  # Явно указываем модель
+            model="GigaChat"  # Указываем модель как строку
         )
         
         prompt = f"""
@@ -86,7 +86,7 @@ def process_with_gigachat(news, weather):
     except Exception as e:
         print(f"Ошибка Gigachat: {e}")
         # Если нейросеть сломалась, отправим хотя бы сырые данные
-        return f" Нейросеть занята, вот сырые данные:\n\n🌤 {weather}\n\n📰 Новости ТАСС:\n{news}"
+        return f" Нейросеть занята, вот сырые данные:\n\n🌤 {weather}\n\n Новости ТАСС:\n{news}"
 
 def send_to_telegram(text):
     """Отправляем текст в Telegram"""
