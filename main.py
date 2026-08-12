@@ -53,24 +53,22 @@ def process_with_gigachat(news, weather):
     print("Обрабатываю данные в Gigachat...")
     
     try:
-        # 1. Инициализируем клиент
+        # Инициализируем GigaChat с ПРАВИЛЬНЫМ базовым URL
         ai = GigaChat(
             credentials=GIGA_CREDENTIALS, 
             scope="GIGACHAT_API_PERS", 
-            verify_ssl_certs=False
+            verify_ssl_certs=False,
+            base_url="https://gigachat-proxy.sberdevices.ru"  # Правильный URL!
         )
         
-        # 2. ВАЖНО: запрашиваем список доступных моделей, чтобы узнать точное название
+        # Получаем список доступных моделей
         try:
             available_models = ai.models()
-            # Выводим в лог GitHub, чтобы мы видели, какие модели доступны
             model_names = [m.id for m in available_models.data]
             print(f"✅ Доступные модели: {model_names}")
-            
-            # Используем первую доступную модель (обычно это 'GigaChat')
             target_model = model_names[0]
         except Exception as e:
-            print(f"⚠️ Не удалось получить список моделей, используем 'GigaChat' по умолчанию. Ошибка: {e}")
+            print(f"⚠️ Не удалось получить список моделей: {e}")
             target_model = "GigaChat"
         
         prompt = f"""
@@ -85,14 +83,13 @@ def process_with_gigachat(news, weather):
         Новости ТАСС: {news}
         """
         
-        # 3. ВАЖНО: передаем параметр model ПРЯМО в метод chat()
+        # Передаем model прямо в метод chat()
         response = ai.chat(prompt, model=target_model)
         return response.choices[0].message.content
         
     except Exception as e:
         print(f"❌ Ошибка Gigachat: {e}")
-        # Если нейросеть не ответила, отправляем сырые данные
-        return f"🤖 Нейросеть временно недоступна, вот сырые данные:\n\n🌤 {weather}\n\n📰 Новости ТАСС:\n{news}"
+        return f"🤖 Нейросеть временно недоступна, вот сырые данные:\n\n🌤 {weather}\n\n Новости ТАСС:\n{news}"
 
 def send_to_telegram(text):
     """Отправляем текст в Telegram"""
