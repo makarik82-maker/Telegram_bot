@@ -27,8 +27,8 @@ jobs:
 
     - name: Run the bot
       env:
-        # Передаем наши секретные ключи в код
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
+        GIGACHAT_MODEL: ${{ secrets.GIGACHAT_MODEL }}  # Добавьте эту строку
       run: python main.py
