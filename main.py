@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 GIGA_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS")
+GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat")  # Модель по умолчанию
 
 def get_rss_news():
     """Собираем новости из RSS ТАСС"""
@@ -60,11 +61,12 @@ def process_with_gigachat(news, weather):
     print("Обрабатываю данные в Gigachat...")
     
     try:
-        # Инициализируем Gigachat БЕЗ указания модели (будет использоваться модель по умолчанию)
+        # Инициализируем Gigachat с указанием модели
         ai = GigaChat(
             credentials=GIGA_CREDENTIALS, 
             scope="GIGACHAT_API_PERS", 
-            verify_ssl_certs=False
+            verify_ssl_certs=False,
+            model=GIGACHAT_MODEL  # Используем переменную окружения
         )
         
         prompt = f"""
@@ -85,7 +87,7 @@ def process_with_gigachat(news, weather):
     except Exception as e:
         print(f"Ошибка Gigachat: {e}")
         # Если нейросеть сломалась, отправим хотя бы сырые данные
-        return f" Нейросеть занята, вот сырые данные:\n\n🌤 {weather}\n\n Новости ТАСС:\n{news}"
+        return f" Нейросеть занята, вот сырые данные:\n\n {weather}\n\n Новости ТАСС:\n{news}"
 
 def send_to_telegram(text):
     """Отправляем текст в Telegram"""
