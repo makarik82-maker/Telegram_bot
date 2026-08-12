@@ -1,7 +1,7 @@
 import os
 import requests
 import feedparser
-from gigachat import GigaChat
+import json
 from datetime import datetime, timedelta
 
 # 1. Получаем наши секретные ключи из настроек GitHub
@@ -48,48 +48,93 @@ def get_weather():
         print(f"Ошибка погоды: {e}")
         return "Не удалось получить погоду."
 
-def process_with_gigachat(news, weather):
-    """Отправляем сырые данные в Gigachat, чтобы она сделала красивый пост"""
-    print("Обрабатываю данные в Gigachat...")
+def get_gigachat_token():
+    """Получаем токен доступа к GigaChat API"""
+    print("Получаю токен GigaChat...")
+    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/json'
+    }
+    
+    data = {
+        'scope': 'GIGACHAT_API_PERS',
+    }
     
     try:
-        # Инициализируем GigaChat с ПРАВИЛЬНЫМ базовым URL
-        ai = GigaChat(
-            credentials=GIGA_CREDENTIALS, 
-            scope="GIGACHAT_API_PERS", 
-            verify_ssl_certs=False,
-            base_url="https://gigachat-proxy.sberdevices.ru"  # Правильный URL!
+        response = requests.post(
+            url, 
+            headers=headers, 
+            data=data, 
+            auth=(GIGA_CREDENTIALS, GIGA_CREDENTIALS),
+            verify=False
         )
-        
-        # Получаем список доступных моделей
-        try:
-            available_models = ai.models()
-            model_names = [m.id for m in available_models.data]
-            print(f"✅ Доступные модели: {model_names}")
-            target_model = model_names[0]
-        except Exception as e:
-            print(f"⚠️ Не удалось получить список моделей: {e}")
-            target_model = "GigaChat"
-        
-        prompt = f"""
-        Ты - редактор новостного Telegram-канала. 
-        Я дам тебе сырые данные. Твоя задача - написать из них короткий, интересный и структурированный пост для Telegram.
-        Используй эмодзи. Раздели на блоки: 🌤 Погода, 📰 Новости (ТАСС).
-        Не выдумывай того, чего нет в данных. 
-        ВАЖНО: Объем текста строго до 3500 символов (лимит Telegram).
-        
-        Данные:
-        Погода: {weather}
-        Новости ТАСС: {news}
-        """
-        
-        # Передаем model прямо в метод chat()
-        response = ai.chat(prompt, model=target_model)
-        return response.choices[0].message.content
+        response.raise_for_status()
+        token_data = response.json()
+        access_token = token_data.get('access_token')
+        print(f"✅ Токен получен успешно")
+        return access_token
+    except Exception as e:
+        print(f"❌ Ошибка получения токена: {e}")
+        return None
+
+def process_with_gigachat(news, weather):
+    """Отправляем сырые данные в Gigachat через прямой HTTP запрос"""
+    print("Обрабатываю данные в Gigachat...")
+    
+    # Шаг 1: Получаем токен
+    access_token = get_gigachat_token()
+    if not access_token:
+        return f"🤖 Ошибка авторизации в GigaChat. Вот сырые данные:\n\n {weather}\n\n📰 Новости ТАСС:\n{news}"
+    
+    # Шаг 2: Отправляем запрос к Chat API
+    url = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
+    
+    headers = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {access_token}'
+    }
+    
+    prompt = f"""Ты - редактор новостного Telegram-канала. 
+Я дам тебе сырые данные. Твоя задача - написать из них короткий, интересный и структурированный пост для Telegram.
+Используй эмодзи. Раздели на блоки: 🌤 Погода, 📰 Новости (ТАСС).
+Не выдумывай того, чего нет в данных. 
+ВАЖНО: Объем текста строго до 3500 символов (лимит Telegram).
+
+Данные:
+Погода: {weather}
+Новости ТАСС: {news}"""
+    
+    payload = {
+        "model": "GigaChat",
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.7,
+        "max_tokens": 1500
+    }
+    
+    try:
+        response = requests.post(
+            url, 
+            headers=headers, 
+            json=payload,
+            verify=False
+        )
+        response.raise_for_status()
+        result = response.json()
+        message_content = result['choices'][0]['message']['content']
+        print("✅ GigaChat успешно обработал данные")
+        return message_content
         
     except Exception as e:
-        print(f"❌ Ошибка Gigachat: {e}")
-        return f"🤖 Нейросеть временно недоступна, вот сырые данные:\n\n🌤 {weather}\n\n Новости ТАСС:\n{news}"
+        print(f" Ошибка Gigachat: {e}")
+        return f"🤖 Нейросеть временно недоступна, вот сырые данные:\n\n🌤 {weather}\n\n📰 Новости ТАСС:\n{news}"
 
 def send_to_telegram(text):
     """Отправляем текст в Telegram"""
@@ -112,7 +157,7 @@ def send_to_telegram(text):
         else:
             print(f"❌ Ошибка Telegram: {response.text}")
     except Exception as e:
-        print(f"❌ Ошибка отправки: {e}")
+        print(f" Ошибка отправки: {e}")
 
 if __name__ == "__main__":
     print("=== Бот запущен ===")
