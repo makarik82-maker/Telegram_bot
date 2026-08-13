@@ -1,14 +1,15 @@
 import os
 import json
 import uuid
+import html
 import logging
-import warnings
+import re
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
+from datetime import datetime, timezone
 
 import requests
 import feedparser
-from urllib3.exceptions import InsecureRequestWarning
 
 
 # ============================================================
@@ -30,22 +31,43 @@ RSS_URLS = [
     "https://tass.ru/rss/economy.xml",
 ]
 
-# Сколько новостей брать за один запуск
-MAX_NEWS = 5
+# Получаем больше материалов, чем публикуем.
+# Это позволяет отфильтровать и ранжировать новости.
+MAX_RSS_ITEMS_PER_FEED = 30
+MAX_NEWS_FOR_POST = 5
 
-# Файл для хранения уже опубликованных новостей
+# Хранилище уже опубликованных новостей
 PUBLISHED_FILE = Path("published_news.json")
+MAX_PUBLISHED_IDS = 1000
 
-# Лимиты
+# Ограничения
 TELEGRAM_MAX_LENGTH = 4000
 GIGACHAT_MAX_TOKENS = 1200
-
-# Таймауты
+RSS_DESCRIPTION_MAX_LENGTH = 800
+GIGACHAT_TIMEOUT = 60
 HTTP_TIMEOUT = 30
 
-# На этапе тестирования оставляем отключение проверки сертификата.
-# Позже это можно заменить на нормальную проверку сертификатов.
-VERIFY_SSL = False
+# ВАЖНО: SSL-проверка включена.
+VERIFY_SSL = True
+
+# Ключевые слова для простого приоритетного ранжирования.
+# Это НЕ заменяет редактора/AI, а только помогает выбрать материалы.
+HIGH_PRIORITY_KEYWORDS = [
+    "москва", "россия", "правительство", "президент",
+    "госдума", "экономика", "рубль", "цб", "центробанк",
+    "инфляция", "нефть", "газ", "санкции", "технологии",
+    "безопасность", "происшествие", "чрезвычай", "закон",
+]
+
+LOW_PRIORITY_KEYWORDS = [
+    "спорт", "футбол", "хоккей", "матч", "турнир",
+    "шоу-бизнес", "кино", "музыка",
+]
+
+# Telegram разрешает только эти теги в HTML parse_mode.
+ALLOWED_TELEGRAM_TAGS = {
+    "b", "strong", "i", "em", "u", "s", "del", "ins", "code", "pre", "a"
+}
 
 
 # ============================================================
@@ -56,15 +78,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-
 logger = logging.getLogger("newsbot")
-
-
-# Убираем предупреждение urllib3 при verify=False
-warnings.filterwarnings(
-    "ignore",
-    category=InsecureRequestWarning
-)
 
 
 # ============================================================
@@ -72,19 +86,14 @@ warnings.filterwarnings(
 # ============================================================
 
 def check_environment() -> None:
-    """Проверяем наличие необходимых GitHub Secrets."""
-
+    """Проверяет наличие необходимых GitHub Secrets."""
     required = {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_TOKEN,
         "TELEGRAM_CHAT_ID": CHAT_ID,
         "GIGACHAT_CREDENTIALS": GIGACHAT_CREDENTIALS,
     }
 
-    missing = [
-        name
-        for name, value in required.items()
-        if not value
-    ]
+    missing = [name for name, value in required.items() if not value]
 
     if missing:
         raise RuntimeError(
@@ -92,71 +101,137 @@ def check_environment() -> None:
             + ", ".join(missing)
         )
 
-    logger.info("Все необходимые секреты найдены.")
+    logger.info("Все необходимые Secrets найдены.")
 
 
 # ============================================================
-# РАБОТА С ОПУБЛИКОВАННЫМИ НОВОСТЯМИ
+# PUBLISHED NEWS
 # ============================================================
 
 def load_published_news() -> List[str]:
-    """Загружает список уже опубликованных новостей."""
-
+    """Загружает список опубликованных ID."""
     if not PUBLISHED_FILE.exists():
         return []
 
     try:
-        with open(
-            PUBLISHED_FILE,
-            "r",
-            encoding="utf-8"
-        ) as file:
+        with PUBLISHED_FILE.open("r", encoding="utf-8") as file:
             data = json.load(file)
 
         if isinstance(data, list):
-            return data
+            return [str(item) for item in data if item]
 
+        logger.warning("Формат %s не является списком.", PUBLISHED_FILE)
         return []
 
-    except Exception as exc:
-        logger.warning(
-            "Не удалось прочитать %s: %s",
-            PUBLISHED_FILE,
-            exc,
-        )
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Не удалось прочитать %s: %s", PUBLISHED_FILE, exc)
         return []
 
 
 def save_published_news(news_ids: List[str]) -> None:
-    """Сохраняет список опубликованных новостей."""
+    """Безопасно сохраняет последние опубликованные ID."""
+    unique_ids = list(dict.fromkeys(str(item) for item in news_ids if item))
+    unique_ids = unique_ids[-MAX_PUBLISHED_IDS:]
 
-    # Оставляем только последние 500 записей,
-    # чтобы файл не рос бесконечно.
-    news_ids = news_ids[-500:]
+    tmp_file = PUBLISHED_FILE.with_suffix(".tmp")
 
     try:
-        with open(
-            PUBLISHED_FILE,
-            "w",
-            encoding="utf-8"
-        ) as file:
-            json.dump(
-                news_ids,
-                file,
-                ensure_ascii=False,
-                indent=2,
-            )
+        with tmp_file.open("w", encoding="utf-8") as file:
+            json.dump(unique_ids, file, ensure_ascii=False, indent=2)
+
+        tmp_file.replace(PUBLISHED_FILE)
 
         logger.info(
             "Сохранён список опубликованных новостей: %d",
-            len(news_ids),
+            len(unique_ids),
         )
 
-    except Exception as exc:
-        logger.error(
-            "Ошибка сохранения published_news.json: %s",
-            exc,
-        )
+    except OSError as exc:
+        logger.error("Ошибка сохранения %s: %s", PUBLISHED_FILE, exc)
+        try:
+            if tmp_file.exists():
+                tmp_file.unlink()
+        except OSError:
+            pass
+
+
+# ============================================================
+# TEXT / RSS NORMALIZATION
+# ============================================================
+
+def strip_html_tags(text: str) -> str:
+    """Удаляет HTML-теги из RSS-описания."""
+    if not text:
+        return ""
+
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def normalize_text(text: str) -> str:
+    """Нормализует пробелы и HTML-сущности."""
+    return re.sub(r"\s+", " ", html.unescape(text or "")).strip()
+
+
+def normalize_url(url: str) -> str:
+    """Минимально нормализует URL для сравнения дублей."""
+    url = (url or "").strip()
+    if not url:
+        return ""
+    return url.rstrip("/")
+
+
+def make_title_key(title: str) -> str:
+    """Создаёт ключ заголовка для дополнительной проверки дублей."""
+    title = normalize_text(title).lower()
+    title = re.sub(r"[^\w\sа-яё]", " ", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title)
+    return title.strip()
+
+
+def truncate_text(text: str, max_length: int) -> str:
+    """Обрезает текст по границе слова."""
+    text = normalize_text(text)
+    if len(text) <= max_length:
+        return text
+
+    shortened = text[:max_length].rsplit(" ", 1)[0].strip()
+    return shortened + "…"
+
+
+def parse_entry_datetime(entry: Any) -> Optional[datetime]:
+    """Извлекает дату RSS и приводит её к UTC."""
+    parsed = (
+        getattr(entry, "published_parsed", None)
+        or getattr(entry, "updated_parsed", None)
+    )
+
+    if parsed:
+        try:
+            from calendar import timegm
+            return datetime.fromtimestamp(timegm(parsed), tz=timezone.utc)
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    raw = (
+        getattr(entry, "published", "")
+        or getattr(entry, "updated", "")
+        or ""
+    ).strip()
+
+    if raw:
+        try:
+            value = raw.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            pass
+
+    return None
 
 
 # ============================================================
@@ -164,26 +239,26 @@ def save_published_news(news_ids: List[str]) -> None:
 # ============================================================
 
 def get_rss_news() -> List[Dict[str, Any]]:
-    """
-    Загружает новости из RSS ТАСС.
-
-    Возвращает список словарей:
-    {
-        title,
-        description,
-        link,
-        published,
-        id
-    }
-    """
-
+    """ Получает новости из RSS, нормализует их, удаляет дубли, сортирует по дате и возвращает кандидатов для дальнейшего отбора. """
     logger.info("Собираю новости из RSS ТАСС...")
 
-    published_news = load_published_news()
-    news_list: List[Dict[str, Any]] = []
+    published_ids = set(load_published_news())
+    candidates: List[Dict[str, Any]] = []
+
+    stats = {
+        "feeds": 0,
+        "raw": 0,
+        "already_published": 0,
+        "duplicates": 0,
+        "accepted": 0,
+    }
+
+    seen_ids = set()
+    seen_urls = set()
+    seen_titles = set()
 
     for rss_url in RSS_URLS:
-
+        stats["feeds"] += 1
         logger.info("Проверяю RSS: %s", rss_url)
 
         try:
@@ -191,13 +266,10 @@ def get_rss_news() -> List[Dict[str, Any]]:
                 rss_url,
                 timeout=HTTP_TIMEOUT,
                 headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 "
-                        "(compatible; NewsBot/1.0)"
-                    )
+                    "User-Agent": "Mozilla/5.0 (compatible; NewsBot/2.0)"
                 },
+                verify=VERIFY_SSL,
             )
-
             response.raise_for_status()
 
             feed = feedparser.parse(response.content)
@@ -205,97 +277,201 @@ def get_rss_news() -> List[Dict[str, Any]]:
             if getattr(feed, "bozo", False):
                 logger.warning(
                     "RSS содержит ошибки: %s",
-                    getattr(
-                        feed,
-                        "bozo_exception",
-                        "неизвестная ошибка"
-                    ),
+                    getattr(feed, "bozo_exception", "неизвестная ошибка"),
                 )
 
-            if not feed.entries:
-                logger.warning(
-                    "RSS не содержит записей: %s",
-                    rss_url,
-                )
+            entries = list(feed.entries)
+            stats["raw"] += len(entries)
+
+            if not entries:
+                logger.warning("RSS не содержит записей: %s", rss_url)
                 continue
 
-            for entry in feed.entries:
+            # Сначала сортируем весь RSS по дате, а затем ограничиваем выборку.
+            entries.sort(
+                key=lambda entry: (
+                    parse_entry_datetime(entry)
+                    or datetime.min.replace(tzinfo=timezone.utc)
+                ),
+                reverse=True,
+            )
 
-                title = (
-                    getattr(entry, "title", "")
-                    or ""
-                ).strip()
-
-                link = (
-                    getattr(entry, "link", "")
-                    or ""
-                ).strip()
-
-                description = (
+            for entry in entries[:MAX_RSS_ITEMS_PER_FEED]:
+                title = normalize_text(getattr(entry, "title", "") or "")
+                link = normalize_url(getattr(entry, "link", "") or "")
+                description = strip_html_tags(
                     getattr(entry, "summary", "")
                     or getattr(entry, "description", "")
                     or ""
-                ).strip()
+                )
+                description = truncate_text(
+                    description, RSS_DESCRIPTION_MAX_LENGTH
+                )
 
-                published = (
+                published_raw = normalize_text(
                     getattr(entry, "published", "")
                     or getattr(entry, "updated", "")
                     or ""
-                ).strip()
-
-                # Уникальный идентификатор новости
-                news_id = (
-                    getattr(entry, "id", None)
-                    or link
-                    or title
                 )
 
-                if not title:
+                entry_date = parse_entry_datetime(entry)
+                published_iso = (
+                    entry_date.isoformat() if entry_date else published_raw
+                )
+
+                entry_id = normalize_text(
+                    getattr(entry, "id", "") or ""
+                )
+
+                # Приоритет идентификаторов:
+                # RSS id -> URL -> заголовок.
+                news_id = entry_id or link or make_title_key(title)
+
+                if not title or not news_id:
                     continue
 
-                if not news_id:
+                title_key = make_title_key(title)
+
+                if news_id in published_ids:
+                    stats["already_published"] += 1
                     continue
 
-                # Не добавляем уже опубликованную новость
-                if news_id in published_news:
+                # Тройная защита от дублей:
+                # ID + URL + нормализованный заголовок.
+                if news_id in seen_ids:
+                    stats["duplicates"] += 1
                     continue
 
-                news_item = {
+                if link and link in seen_urls:
+                    stats["duplicates"] += 1
+                    continue
+
+                if title_key and title_key in seen_titles:
+                    stats["duplicates"] += 1
+                    continue
+
+                item = {
                     "id": news_id,
                     "title": title,
                     "description": description,
                     "link": link,
-                    "published": published,
+                    "published": published_raw,
+                    "published_iso": published_iso,
+                    "source": "ТАСС",
                 }
 
-                news_list.append(news_item)
+                candidates.append(item)
+                seen_ids.add(news_id)
+                if link:
+                    seen_urls.add(link)
+                if title_key:
+                    seen_titles.add(title_key)
 
-                if len(news_list) >= MAX_NEWS:
-                    break
-
-            if len(news_list) >= MAX_NEWS:
-                break
+                stats["accepted"] += 1
 
         except requests.RequestException as exc:
-            logger.error(
-                "Ошибка загрузки RSS %s: %s",
-                rss_url,
-                exc,
-            )
+            logger.error("Ошибка загрузки RSS %s: %s", rss_url, exc)
 
         except Exception as exc:
-            logger.error(
-                "Ошибка обработки RSS %s: %s",
-                rss_url,
-                exc,
-            )
+            logger.exception("Ошибка обработки RSS %s: %s", rss_url, exc)
 
-    logger.info(
-        "Получено новых новостей: %d",
-        len(news_list),
+    candidates.sort(
+        key=lambda item: item.get("published_iso", ""),
+        reverse=True,
     )
 
-    return news_list[:MAX_NEWS]
+    logger.info(
+        "RSS: источников=%d, записей=%d, уже опубликовано=%d, "
+        "дублей=%d, принято=%d",
+        stats["feeds"],
+        stats["raw"],
+        stats["already_published"],
+        stats["duplicates"],
+        stats["accepted"],
+    )
+
+    return candidates
+
+
+# ============================================================
+# NEWS RANKING
+# ============================================================
+
+def calculate_news_score(news: Dict[str, Any]) -> int:
+    """ Рассчитывает простой редакционный приоритет. Более свежие и тематически важные новости получают больший балл. """
+    title = normalize_text(news.get("title", "")).lower()
+    description = normalize_text(news.get("description", "")).lower()
+    text = f"{title} {description}"
+
+    score = 0
+
+    for keyword in HIGH_PRIORITY_KEYWORDS:
+        if keyword in text:
+            score += 3
+
+    for keyword in LOW_PRIORITY_KEYWORDS:
+        if keyword in text:
+            score -= 2
+
+    # Наличие описания и ссылки повышает качество исходного материала.
+    if description:
+        score += 1
+    if news.get("link"):
+        score += 1
+
+    # Более свежие материалы получают небольшой бонус.
+    try:
+        published = datetime.fromisoformat(
+            news.get("published_iso", "")
+        )
+        age_hours = max(
+            0,
+            (datetime.now(timezone.utc) - published).total_seconds() / 3600,
+        )
+        score += max(0, int(24 - age_hours) // 6)
+    except (ValueError, TypeError):
+        pass
+
+    return score
+
+
+def select_news_for_post( candidates: List[Dict[str, Any]], ) -> List[Dict[str, Any]]:
+    """Ранжирует кандидатов и выбирает материалы для поста."""
+    if not candidates:
+        logger.info("Для публикации нет новостей.")
+        return []
+
+    ranked = []
+    for item in candidates:
+        enriched = dict(item)
+        enriched["score"] = calculate_news_score(item)
+        ranked.append(enriched)
+
+    ranked.sort(
+        key=lambda item: (
+            item.get("score", 0),
+            item.get("published_iso", ""),
+        ),
+        reverse=True,
+    )
+
+    selected = ranked[:MAX_NEWS_FOR_POST]
+
+    logger.info(
+        "Ранжирование: кандидатов=%d, выбрано=%d",
+        len(candidates),
+        len(selected),
+    )
+
+    for index, item in enumerate(selected, start=1):
+        logger.info(
+            "Новость #%d: score=%d | %s",
+            index,
+            item.get("score", 0),
+            truncate_text(item.get("title", ""), 120),
+        )
+
+    return selected
 
 
 # ============================================================
@@ -304,19 +480,14 @@ def get_rss_news() -> List[Dict[str, Any]]:
 
 def get_weather() -> str:
     """Получает текущую погоду и прогноз на завтра."""
-
     logger.info("Получаю погоду из Open-Meteo...")
 
     url = "https://api.open-meteo.com/v1/forecast"
-
     params = {
         "latitude": WEATHER_LATITUDE,
         "longitude": WEATHER_LONGITUDE,
         "current_weather": "true",
-        "daily": (
-            "temperature_2m_max,"
-            "temperature_2m_min"
-        ),
+        "daily": "temperature_2m_max,temperature_2m_min",
         "timezone": WEATHER_TIMEZONE,
     }
 
@@ -325,39 +496,18 @@ def get_weather() -> str:
             url,
             params=params,
             timeout=HTTP_TIMEOUT,
+            verify=VERIFY_SSL,
         )
-
         response.raise_for_status()
 
         data = response.json()
+        current_weather = data.get("current_weather") or {}
+        daily = data.get("daily") or {}
 
-        current_weather = data.get(
-            "current_weather",
-            {}
-        )
-
-        daily = data.get(
-            "daily",
-            {}
-        )
-
-        current_temp = current_weather.get(
-            "temperature"
-        )
-
-        current_wind = current_weather.get(
-            "windspeed"
-        )
-
-        max_temperature = daily.get(
-            "temperature_2m_max",
-            []
-        )
-
-        min_temperature = daily.get(
-            "temperature_2m_min",
-            []
-        )
+        current_temp = current_weather.get("temperature")
+        current_wind = current_weather.get("windspeed")
+        max_temperature = daily.get("temperature_2m_max") or []
+        min_temperature = daily.get("temperature_2m_min") or []
 
         if (
             current_temp is None
@@ -365,64 +515,41 @@ def get_weather() -> str:
             or len(max_temperature) < 2
             or len(min_temperature) < 2
         ):
-            raise ValueError(
-                "Open-Meteo вернул неполные данные"
-            )
-
-        tomorrow_max = max_temperature[1]
-        tomorrow_min = min_temperature[1]
+            raise ValueError("Open-Meteo вернул неполные данные")
 
         weather_text = (
-            f"Сейчас в Москве: "
-            f"{current_temp}°C, "
-            f"ветер {current_wind} км/ч.\n"
-            f"Завтра: от {tomorrow_min}°C "
-            f"до {tomorrow_max}°C."
+            f"Сейчас в Москве: {current_temp}°C, "
+            f"ветер {current_wind} км/ч. "
+            f"Завтра: от {min_temperature[1]}°C "
+            f"до {max_temperature[1]}°C."
         )
 
         logger.info("Погода успешно получена.")
-
         return weather_text
 
     except Exception as exc:
-        logger.error(
-            "Ошибка получения погоды: %s",
-            exc,
-        )
-
-        return (
-            "Не удалось получить данные о погоде."
-        )
+        logger.error("Ошибка получения погоды: %s", exc)
+        return "Данные о погоде временно недоступны."
 
 
 # ============================================================
-# GIGACHAT — ПОЛУЧЕНИЕ ТОКЕНА
+# GIGACHAT — TOKEN
 # ============================================================
 
-def get_gigachat_token() -> str | None:
+def get_gigachat_token() -> Optional[str]:
     """Получает OAuth-токен GigaChat."""
-
     logger.info("Получаю токен GigaChat...")
 
-    url = (
-        "https://ngw.devices.sberbank.ru:9443"
-        "/api/v2/oauth"
-    )
+    url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 
     headers = {
-        "Content-Type": (
-            "application/x-www-form-urlencoded"
-        ),
+        "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
         "RqUID": str(uuid.uuid4()),
-        "Authorization": (
-            f"Basic {GIGACHAT_CREDENTIALS}"
-        ),
+        "Authorization": f"Basic {GIGACHAT_CREDENTIALS}",
     }
 
-    data = {
-        "scope": "GIGACHAT_API_PERS",
-    }
+    data = {"scope": "GIGACHAT_API_PERS"}
 
     try:
         response = requests.post(
@@ -432,204 +559,90 @@ def get_gigachat_token() -> str | None:
             verify=VERIFY_SSL,
             timeout=HTTP_TIMEOUT,
         )
-
         response.raise_for_status()
 
         token_data = response.json()
-
-        access_token = token_data.get(
-            "access_token"
-        )
+        access_token = token_data.get("access_token")
 
         if not access_token:
-            logger.error(
-                "GigaChat не вернул access_token."
-            )
-
-            logger.error(
-                "Ответ сервера: %s",
-                response.text,
-            )
-
+            logger.error("GigaChat не вернул access_token.")
+            logger.error("Ответ сервера: %s", response.text[:1000])
             return None
 
-        logger.info(
-            "Токен GigaChat успешно получен."
-        )
-
+        logger.info("Токен GigaChat успешно получен.")
         return access_token
 
     except requests.HTTPError as exc:
-        logger.error(
-            "HTTP ошибка GigaChat OAuth: %s",
-            exc,
-        )
-
+        logger.error("HTTP ошибка GigaChat OAuth: %s", exc)
         try:
-            logger.error(
-                "Ответ сервера: %s",
-                response.text,
-            )
+            logger.error("Ответ сервера: %s", response.text[:1000])
         except Exception:
             pass
-
         return None
 
     except Exception as exc:
-        logger.error(
-            "Ошибка получения токена GigaChat: %s",
-            exc,
-        )
-
+        logger.error("Ошибка получения токена GigaChat: %s", exc)
         return None
 
 
 # ============================================================
-# ПОДГОТОВКА НОВОСТЕЙ ДЛЯ GIGACHAT
+# GIGACHAT — INPUT
 # ============================================================
 
-def prepare_news_for_gigachat(
-    news: List[Dict[str, Any]]
-) -> str:
-    """Формирует текст с новостями для GigaChat."""
-
+def prepare_news_for_gigachat( news: List[Dict[str, Any]], ) -> str:
+    """Формирует компактные исходные данные для AI."""
     if not news:
         return "Новых новостей нет."
 
     parts = []
 
-    for index, item in enumerate(
-        news,
-        start=1
-    ):
-        title = item.get(
-            "title",
-            ""
-        )
-
-        description = item.get(
-            "description",
-            ""
-        )
-
-        published = item.get(
-            "published",
-            ""
-        )
-
-        link = item.get(
-            "link",
-            ""
-        )
-
-        # Ограничиваем описание,
-        # чтобы не отправлять слишком большой prompt.
-        description = description[:1500]
-
+    for index, item in enumerate(news, start=1):
         block = (
             f"НОВОСТЬ {index}\n"
-            f"Заголовок: {title}\n"
-            f"Описание: {description}\n"
-            f"Дата: {published}\n"
-            f"Ссылка: {link}"
+            f"ID: {item.get('id', '')}\n"
+            f"Заголовок: {item.get('title', '')}\n"
+            f"Описание: {item.get('description', '')}\n"
+            f"Дата: {item.get('published', '')}\n"
+            f"Ссылка: {item.get('link', '')}"
         )
-
         parts.append(block)
 
     return "\n\n".join(parts)
 
 
 # ============================================================
-# GIGACHAT — ГЕНЕРАЦИЯ ПОСТА
+# GIGACHAT — ANALYSIS / SUMMARY
 # ============================================================
 
-def process_with_gigachat(
-    news: List[Dict[str, Any]],
-    weather: str
-) -> str:
-    """Создаёт готовый пост через GigaChat."""
+def process_with_gigachat( news: List[Dict[str, Any]], ) -> List[Dict[str, str]]:
+    """ AI занимается только редакционной обработкой: выбирает/сжимает информацию, но НЕ формирует Telegram HTML. """
+    if not news:
+        return []
 
     logger.info(
-        "Передаю данные в GigaChat..."
+        "Передаю в GigaChat %d новостей для редакционной обработки...",
+        len(news),
     )
 
     access_token = get_gigachat_token()
 
     if not access_token:
-
         logger.warning(
-            "GigaChat недоступен. "
-            "Использую резервный вариант."
+            "GigaChat недоступен. Использую исходные заголовки и описания."
         )
+        return create_fallback_articles(news)
 
-        return create_fallback_post(
-            news,
-            weather,
-        )
+    news_text = prepare_news_for_gigachat(news)
 
-    news_text = prepare_news_for_gigachat(
-        news
-    )
+    prompt = f""" Ты — новостной редактор Telegram-канала. Обработай ПЕРЕДАННЫЕ НИЖЕ новости. КРИТИЧЕСКИЕ ПРАВИЛА: 1. Ничего не выдумывай. 2. Используй только факты из исходных данных. 3. Не добавляй собственные оценки. 4. Не добавляй причины, последствия или детали, которых нет в источнике. 5. Не изменяй цифры, имена и названия. 6. Не придумывай цитаты. 7. Не создавай новые ссылки. 8. Для каждой новости дай короткий заголовок и краткое резюме в 1–2 предложениях. 9. Верни результат СТРОГО в JSON-массиве. 10. Каждый элемент должен содержать поля: id, title, summary, link 11. ID и link должны быть взяты из исходных данных без изменения. 12. Не добавляй Markdown, HTML или пояснения до/после JSON. Пример структуры: [ {{ "id": "исходный_id", "title": "Короткий заголовок", "summary": "Краткое резюме.", "link": "исходная_ссылка" }} ] ИСХОДНЫЕ НОВОСТИ: {news_text} """.strip()
 
-    url = (
-        "https://api.giga.chat"
-        "/v1/chat/completions"
-    )
+    url = "https://api.giga.chat/v1/chat/completions"
 
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "Authorization": (
-            f"Bearer {access_token}"
-        ),
+        "Authorization": f"Bearer {access_token}",
     }
-
-    prompt = f"""
-Ты — редактор новостного Telegram-канала.
-Твоя задача — подготовить короткий,
-интересный и аккуратно структурированный
-новостной пост на русском языке.
-НИЧЕГО НЕ ВЫДУМЫВАЙ.
-Не добавляй:
-- собственные факты;
-- неподтверждённые сведения;
-- оценки, которых нет в исходных данных;
-- придуманные цифры;
-- придуманные цитаты.
-
-Формат поста:
-
-🌤 <strong>Погода</strong>
-
-Краткая информация о текущей погоде
-и прогнозе на завтра.
-
-📰 <strong>Новости</strong>
-
-Для каждой новости:
-• короткий и понятный заголовок;
-• 1–2 предложения с сутью события.
-
-В конце каждой новости,
-если ссылка присутствует в исходных данных,
-можно добавить её отдельной строкой.
-
-Текст должен быть пригоден
-для публикации в Telegram.
-
-Максимальный объём:
-3000 символов.
-
-Не используй Markdown.
-Разрешён простой HTML Telegram:
-<strong>, <b>, <i>, <em>, <u>, <s>.
-
-ДАННЫЕ О ПОГОДЕ:
-{weather}
-
-НОВОСТИ:
-{news_text}
-""".strip()
 
     payload = {
         "model": "GigaChat-2",
@@ -639,355 +652,8 @@ def process_with_gigachat(
                 "content": prompt,
             }
         ],
-        "temperature": 0.2,
+        "temperature": 0.1,
         "max_tokens": GIGACHAT_MAX_TOKENS,
     }
 
-    try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            verify=VERIFY_SSL,
-            timeout=60,
-        )
-
-        response.raise_for_status()
-
-        result = response.json()
-
-        choices = result.get(
-            "choices",
-            []
-        )
-
-        if not choices:
-            raise ValueError(
-                "GigaChat вернул пустой список choices"
-            )
-
-        message = choices[0].get(
-            "message",
-            {}
-        )
-
-        content = message.get(
-            "content",
-            ""
-        )
-
-        if not content:
-            raise ValueError(
-                "GigaChat не вернул текст"
-            )
-
-        content = content.strip()
-
-        logger.info(
-            "GigaChat успешно подготовил пост."
-        )
-
-        return content
-
-    except Exception as exc:
-        logger.error(
-            "Ошибка GigaChat: %s",
-            exc,
-        )
-
-        return create_fallback_post(
-            news,
-            weather,
-        )
-
-
-# ============================================================
-# РЕЗЕРВНЫЙ ПОСТ БЕЗ GIGACHAT
-# ============================================================
-
-def create_fallback_post(
-    news: List[Dict[str, Any]],
-    weather: str
-) -> str:
-    """
-    Формирует простой пост,
-    если GigaChat недоступен.
-    """
-
-    parts = [
-        "🌤 <strong>Погода</strong>",
-        weather,
-        "",
-        "📰 <strong>Новости</strong>",
-    ]
-
-    if not news:
-        parts.append(
-            "Новых новостей нет."
-        )
-    else:
-        for item in news:
-
-            title = item.get(
-                "title",
-                ""
-            )
-
-            link = item.get(
-                "link",
-                ""
-            )
-
-            parts.append(
-                f"• {title}"
-            )
-
-            if link:
-                parts.append(link)
-
-    return "\n".join(parts)
-
-
-# ============================================================
-# ОЧИСТКА TELEGRAM HTML
-# ============================================================
-
-def sanitize_telegram_text(
-    text: str
-) -> str:
-    """
-    Минимальная очистка текста перед Telegram.
-
-    Сохраняем разрешённые HTML-теги,
-    убираем Markdown-кодовые блоки.
-    """
-
-    text = text.strip()
-
-    # Убираем случайные тройные backticks
-    text = text.replace("```html", "")
-    text = text.replace("```", "")
-
-    text = text.strip()
-
-    return text
-
-
-# ============================================================
-# TELEGRAM
-# ============================================================
-
-def send_to_telegram(text: str) -> bool:
-    """Отправляет пост в Telegram."""
-
-    logger.info(
-        "Отправляю сообщение в Telegram..."
-    )
-
-    if not TELEGRAM_TOKEN:
-        logger.error(
-            "TELEGRAM_BOT_TOKEN не задан."
-        )
-        return False
-
-    if not CHAT_ID:
-        logger.error(
-            "TELEGRAM_CHAT_ID не задан."
-        )
-        return False
-
-    text = sanitize_telegram_text(text)
-
-    # Telegram ограничивает sendMessage примерно
-    # 4096 символами. Используем запас.
-    if len(text) > TELEGRAM_MAX_LENGTH:
-
-        logger.warning(
-            "Сообщение слишком длинное: %d символов.",
-            len(text),
-        )
-
-        text = (
-            text[:TELEGRAM_MAX_LENGTH - 50]
-            + "\n\n..."
-        )
-
-    url = (
-        f"https://api.telegram.org"
-        f"/bot{TELEGRAM_TOKEN}"
-        f"/sendMessage"
-    )
-
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
-
-    try:
-        response = requests.post(
-            url,
-            data=payload,
-            timeout=HTTP_TIMEOUT,
-        )
-
-        response.raise_for_status()
-
-        result = response.json()
-
-        if not result.get("ok"):
-            logger.error(
-                "Telegram вернул ошибку: %s",
-                result,
-            )
-            return False
-
-        logger.info(
-            "✅ Сообщение успешно отправлено в Telegram."
-        )
-
-        return True
-
-    except requests.HTTPError as exc:
-
-        logger.error(
-            "HTTP ошибка Telegram: %s",
-            exc,
-        )
-
-        try:
-            logger.error(
-                "Ответ Telegram: %s",
-                response.text,
-            )
-        except Exception:
-            pass
-
-        return False
-
-    except Exception as exc:
-
-        logger.error(
-            "Ошибка отправки в Telegram: %s",
-            exc,
-        )
-
-        return False
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main() -> None:
-
-    logger.info(
-        "=========================================="
-    )
-
-    logger.info(
-        "        NEWS BOT — START"
-    )
-
-    logger.info(
-        "=========================================="
-    )
-
-    # 1. Проверяем Secrets
-    check_environment()
-
-    # 2. Получаем RSS
-    news = get_rss_news()
-
-    # 3. Получаем погоду
-    weather = get_weather()
-
-    # 4. Если нет новых новостей,
-    # всё равно можно опубликовать погоду.
-    if news:
-        logger.info(
-            "Найдено новых новостей: %d",
-            len(news),
-        )
-    else:
-        logger.info(
-            "Новых новостей не найдено."
-        )
-
-    # 5. Генерируем пост
-    final_post = process_with_gigachat(
-        news,
-        weather,
-    )
-
-    if not final_post:
-        logger.error(
-            "Не удалось сформировать пост."
-        )
-        return
-
-    logger.info(
-        "Размер готового поста: %d символов.",
-        len(final_post),
-    )
-
-    # 6. Отправляем в Telegram
-    success = send_to_telegram(
-        final_post
-    )
-
-    # 7. Только после успешной отправки
-    # помечаем новости как опубликованные.
-    if success and news:
-
-        published_news = (
-            load_published_news()
-        )
-
-        for item in news:
-
-            news_id = item.get("id")
-
-            if news_id and news_id not in published_news:
-                published_news.append(
-                    news_id
-                )
-
-        save_published_news(
-            published_news
-        )
-
-    if success:
-        logger.info(
-            "=========================================="
-        )
-        logger.info(
-            "        NEWS BOT — SUCCESS"
-        )
-        logger.info(
-            "=========================================="
-        )
-    else:
-        logger.error(
-            "=========================================="
-        )
-        logger.error(
-            "        NEWS BOT — FAILED"
-        )
-        logger.error(
-            "=========================================="
-        )
-
-        # GitHub Actions должен увидеть ошибку
-        raise RuntimeError(
-            "Не удалось отправить сообщение в Telegram."
-        )
-
-
-# ============================================================
-# ENTRY POINT
-# ============================================================
-
-if __name__ == "__main__":
-    main()
+    started = datetime.
