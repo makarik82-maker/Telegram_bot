@@ -656,4 +656,421 @@ def process_with_gigachat( news: List[Dict[str, Any]], ) -> List[Dict[str, str]]
         "max_tokens": GIGACHAT_MAX_TOKENS,
     }
 
-    started = datetime.
+    started = datetime.now(timezone.utc)
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            verify=VERIFY_SSL,
+            timeout=GIGACHAT_TIMEOUT,
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        choices = result.get("choices") or []
+
+        if not choices:
+            raise ValueError("GigaChat вернул пустой список choices")
+
+        message = choices[0].get("message") or {}
+        content = (message.get("content") or "").strip()
+
+        if not content:
+            raise ValueError("GigaChat не вернул текст")
+
+        articles = parse_gigachat_json(content, news)
+
+        elapsed = (
+            datetime.now(timezone.utc) - started
+        ).total_seconds()
+
+        logger.info(
+            "GigaChat успешно обработал новости за %.2f сек.: %d материалов.",
+            elapsed,
+            len(articles),
+        )
+
+        return articles
+
+    except Exception as exc:
+        elapsed = (
+            datetime.now(timezone.utc) - started
+        ).total_seconds()
+
+        logger.error(
+            "Ошибка GigaChat после %.2f сек.: %s",
+            elapsed,
+            exc,
+        )
+        return create_fallback_articles(news)
+
+
+def parse_gigachat_json( content: str, source_news: List[Dict[str, Any]], ) -> List[Dict[str, str]]:
+    """Проверяет JSON GigaChat и возвращает только допустимые поля."""
+    cleaned = content.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    data = json.loads(cleaned)
+
+    if not isinstance(data, list):
+        raise ValueError("GigaChat вернул не JSON-массив")
+
+    source_by_id = {
+        str(item.get("id")): item for item in source_news
+    }
+
+    result = []
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        item_id = str(item.get("id") or "")
+        source = source_by_id.get(item_id)
+
+        if not source:
+            logger.warning(
+                "GigaChat вернул неизвестный ID: %s",
+                item_id,
+            )
+            continue
+
+        title = normalize_text(str(item.get("title") or ""))
+        summary = normalize_text(str(item.get("summary") or ""))
+
+        # Ссылку НЕ доверяем AI — берём её только из исходного RSS.
+        link = source.get("link", "")
+
+        if not title:
+            title = source.get("title", "")
+
+        if not summary:
+            summary = source.get("description", "")
+
+        result.append(
+            {
+                "id": item_id,
+                "title": truncate_text(title, 250),
+                "summary": truncate_text(summary, 700),
+                "link": link,
+            }
+        )
+
+    if not result:
+        raise ValueError("После проверки JSON не осталось новостей")
+
+    return result[:MAX_NEWS_FOR_POST]
+
+
+def create_fallback_articles( news: List[Dict[str, Any]], ) -> List[Dict[str, str]]:
+    """Резервный вариант без GigaChat."""
+    result = []
+
+    for item in news[:MAX_NEWS_FOR_POST]:
+        result.append(
+            {
+                "id": str(item.get("id", "")),
+                "title": truncate_text(item.get("title", ""), 250),
+                "summary": truncate_text(
+                    item.get("description", ""),
+                    700,
+                ),
+                "link": item.get("link", ""),
+            }
+        )
+
+    return result
+
+
+# ============================================================
+# TELEGRAM HTML
+# ============================================================
+
+def escape_telegram_text(text: str) -> str:
+    """Экранирует текст перед ручным HTML-форматированием."""
+    return html.escape(normalize_text(text), quote=False)
+
+
+def build_telegram_post( articles: List[Dict[str, str]], weather: str, ) -> str:
+    """ Формирует Telegram HTML самостоятельно. AI здесь больше не отвечает за разметку. """
+    parts = [
+        "🌤 <strong>Погода</strong>",
+        escape_telegram_text(weather),
+        "",
+        "📰 <strong>Главные новости</strong>",
+    ]
+
+    if not articles:
+        parts.append("Новых новостей нет.")
+    else:
+        for index, item in enumerate(articles, start=1):
+            title = escape_telegram_text(item.get("title", ""))
+            summary = escape_telegram_text(item.get("summary", ""))
+            link = normalize_url(item.get("link", ""))
+
+            parts.append("")
+            parts.append(f"<strong>{index}. {title}</strong>")
+
+            if summary:
+                parts.append(summary)
+
+            if link:
+                # URL берётся только из RSS и экранируется для HTML-атрибута.
+                safe_link = html.escape(link, quote=True)
+                parts.append(f'<a href="{safe_link}">Источник: ТАСС</a>')
+
+    post = "\n".join(parts).strip()
+
+    logger.info("Сформирован Telegram-пост: %d символов.", len(post))
+    return post
+
+
+def validate_telegram_html(text: str) -> Tuple[bool, str]:
+    """ Проверяет баланс и набор HTML-тегов. Это не полноценный HTML-парсер, а дополнительный защитный слой. """
+    if not text or not text.strip():
+        return False, "Пост пустой."
+
+    if len(text) > TELEGRAM_MAX_LENGTH:
+        return False, (
+            f"Пост слишком длинный: {len(text)} > "
+            f"{TELEGRAM_MAX_LENGTH}."
+        )
+
+    tags = re.findall(r"</?([A-Za-z0-9]+)(?:\s[^>]*)?>", text)
+
+    for tag in tags:
+        if tag.lower() not in ALLOWED_TELEGRAM_TAGS:
+            return False, f"Недопустимый Telegram HTML-тег: <{tag}>"
+
+    # Проверяем простые парные теги.
+    stack = []
+    token_pattern = re.compile(
+        r"<(/?)([A-Za-z0-9]+)(?:\s[^>]*)?>"
+    )
+
+    self_closing = set()
+
+    for match in token_pattern.finditer(text):
+        closing = bool(match.group(1))
+        tag = match.group(2).lower()
+
+        if tag == "a":
+            # <a> в нашем генераторе всегда парный.
+            pass
+
+        if closing:
+            if not stack or stack[-1] != tag:
+                return False, f"Неправильная последовательность HTML: </{tag}>"
+            stack.pop()
+        else:
+            stack.append(tag)
+
+    if stack:
+        return False, (
+            "Незакрытые HTML-теги: "
+            + ", ".join(stack)
+        )
+
+    return True, "HTML корректен."
+
+
+def fit_post_to_telegram_limit( articles: List[Dict[str, str]], weather: str, ) -> str:
+    """ Формирует пост и при необходимости уменьшает количество новостей. Никогда не обрезает HTML посередине тега. """
+    selected = list(articles)
+
+    while selected:
+        post = build_telegram_post(selected, weather)
+
+        valid, reason = validate_telegram_html(post)
+
+        if valid:
+            return post
+
+        if len(post) <= TELEGRAM_MAX_LENGTH:
+            logger.error("Ошибка проверки Telegram HTML: %s", reason)
+        else:
+            logger.warning(
+                "Пост превышает лимит Telegram (%d). "
+                "Уменьшаю число новостей.",
+                len(post),
+            )
+
+        selected.pop()
+
+    # Даже если новостей нет, погода должна быть опубликована.
+    post = build_telegram_post([], weather)
+
+    valid, reason = validate_telegram_html(post)
+
+    if not valid:
+        raise ValueError(
+            f"Не удалось сформировать корректный Telegram-пост: {reason}"
+        )
+
+    return post
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_to_telegram(text: str) -> bool:
+    """Отправляет проверенный HTML-пост в Telegram."""
+    logger.info("Отправляю сообщение в Telegram...")
+
+    if not TELEGRAM_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN не задан.")
+        return False
+
+    if not CHAT_ID:
+        logger.error("TELEGRAM_CHAT_ID не задан.")
+        return False
+
+    valid, reason = validate_telegram_html(text)
+
+    if not valid:
+        logger.error("Пост не прошёл проверку: %s", reason)
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+
+    try:
+        response = requests.post(
+            url,
+            data=payload,
+            timeout=HTTP_TIMEOUT,
+            verify=VERIFY_SSL,
+        )
+        response.raise_for_status()
+
+        result = response.json()
+
+        if not result.get("ok"):
+            logger.error("Telegram вернул ошибку: %s", result)
+            return False
+
+        message_id = (
+            (result.get("result") or {}).get("message_id")
+        )
+
+        logger.info(
+            "✅ Сообщение успешно отправлено в Telegram. message_id=%s",
+            message_id,
+        )
+
+        return True
+
+    except requests.HTTPError as exc:
+        logger.error("HTTP ошибка Telegram: %s", exc)
+        try:
+            logger.error("Ответ Telegram: %s", response.text[:2000])
+        except Exception:
+            pass
+        return False
+
+    except Exception as exc:
+        logger.error("Ошибка отправки в Telegram: %s", exc)
+        return False
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main() -> None:
+    logger.info("==========================================")
+    logger.info(" NEWS BOT V2 — START")
+    logger.info("==========================================")
+
+    # 1. Secrets
+    check_environment()
+
+    # 2. Получаем широкий список RSS-кандидатов.
+    candidates = get_rss_news()
+
+    # 3. Ранжируем и выбираем лучшие новости.
+    selected_news = select_news_for_post(candidates)
+
+    # 4. Погода — дополнительный блок.
+    weather = get_weather()
+
+    # 5. AI только редактирует новости, но не формирует HTML.
+    articles = process_with_gigachat(selected_news)
+
+    # 6. Python формирует Telegram HTML.
+    final_post = fit_post_to_telegram_limit(
+        articles,
+        weather,
+    )
+
+    # 7. Контроль качества перед публикацией.
+    valid, reason = validate_telegram_html(final_post)
+
+    if not valid:
+        raise RuntimeError(
+            f"Пост не прошёл финальную проверку: {reason}"
+        )
+
+    logger.info(
+        "Финальный пост готов: %d символов, новостей=%d",
+        len(final_post),
+        len(articles),
+    )
+
+    # 8. Отправляем.
+    success = send_to_telegram(final_post)
+
+    # 9. Только после подтверждённой отправки сохраняем ID.
+    if success and articles:
+        published_news = load_published_news()
+        published_set = set(published_news)
+
+        published_count = 0
+
+        for item in articles:
+            news_id = item.get("id")
+
+            if news_id and news_id not in published_set:
+                published_news.append(news_id)
+                published_set.add(news_id)
+                published_count += 1
+
+        save_published_news(published_news)
+
+        logger.info(
+            "Успешно отмечено опубликованными: %d",
+            published_count,
+        )
+
+    if success:
+        logger.info("==========================================")
+        logger.info(" NEWS BOT V2 — SUCCESS")
+        logger.info("==========================================")
+    else:
+        logger.error("==========================================")
+        logger.error(" NEWS BOT V2 — FAILED")
+        logger.error("==========================================")
+        raise RuntimeError(
+            "Не удалось отправить сообщение в Telegram."
+        )
+
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
+
+if __name__ == "__main__":
+    main()
+
