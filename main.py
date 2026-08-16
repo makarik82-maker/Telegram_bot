@@ -38,7 +38,7 @@ MAX_NEWS_FOR_POST = 5
 
 # Хранилище уже опубликованных новостей
 PUBLISHED_FILE = Path("published_news.json")
-MAX_PUBLISHED_IDS = 1000
+MAX_PUBLISHED_IDS = 10000
 
 # Ограничения
 TELEGRAM_MAX_LENGTH = 4000
@@ -60,7 +60,7 @@ HIGH_PRIORITY_KEYWORDS = [
 ]
 
 LOW_PRIORITY_KEYWORDS = [
-    "спорт", "футбол", "хоккей", "матч", "турнир",
+    "хоккей", "матч", "турнир",
     "шоу-бизнес", "кино", "музыка",
 ]
 
